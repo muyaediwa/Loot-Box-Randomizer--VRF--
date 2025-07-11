@@ -6,6 +6,8 @@
 (define-constant err-invalid-rarity (err u104))
 (define-constant err-no-items (err u105))
 (define-constant err-invalid-item (err u106))
+(define-constant err-insufficient-items (err u107))
+(define-constant err-invalid-fusion (err u108))
 
 (define-data-var box-counter uint u0)
 (define-data-var item-counter uint u0)
@@ -33,6 +35,12 @@
 (define-map user-inventory { user: principal, item-id: uint } uint)
 
 (define-map rarity-pools uint (list 20 uint))
+
+(define-map fusion-recipes uint { 
+  input-rarity: uint, 
+  input-count: uint, 
+  output-rarity: uint 
+})
 
 (define-private (get-next-box-id)
   (begin
@@ -82,6 +90,29 @@
       (map-set items item-id (merge item-data { total-supply: (+ (get total-supply item-data) u1) }))
     false))
 
+(define-private (remove-from-inventory (user principal) (item-id uint) (amount uint))
+  (let (
+    (current-amount (default-to u0 (map-get? user-inventory { user: user, item-id: item-id })))
+  )
+    (if (>= current-amount amount)
+      (begin
+        (map-set user-inventory { user: user, item-id: item-id } (- current-amount amount))
+        true)
+      false)))
+
+(define-private (validate-and-consume-item (item-id uint) (acc bool))
+  (if (not acc)
+    false
+    (match (map-get? items item-id)
+      item-data
+        (let (
+          (user-count (get-user-item-count tx-sender item-id))
+        )
+          (if (> user-count u0)
+            (remove-from-inventory tx-sender item-id u1)
+            false))
+      false)))
+
 (define-public (initialize-rarity-pools)
   (begin
     (asserts! (is-eq tx-sender contract-owner) err-owner-only)
@@ -90,6 +121,15 @@
     (map-set rarity-pools u3 (list))
     (map-set rarity-pools u4 (list))
     (map-set rarity-pools u5 (list))
+    (ok true)))
+
+(define-public (initialize-fusion-recipes)
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (map-set fusion-recipes u1 { input-rarity: u1, input-count: u3, output-rarity: u2 })
+    (map-set fusion-recipes u2 { input-rarity: u2, input-count: u3, output-rarity: u3 })
+    (map-set fusion-recipes u3 { input-rarity: u3, input-count: u2, output-rarity: u4 })
+    (map-set fusion-recipes u4 { input-rarity: u4, input-count: u2, output-rarity: u5 })
     (ok true)))
 
 (define-public (add-item (name (string-ascii 64)) (rarity uint) (value uint))
@@ -151,6 +191,27 @@
     (var-set vrf-seed new-seed)
     (ok true)))
 
+(define-public (fuse-items (input-rarity uint) (item-ids (list 10 uint)))
+  (let (
+    (recipe (unwrap! (map-get? fusion-recipes input-rarity) err-invalid-fusion))
+    (required-count (get input-count recipe))
+    (output-rarity (get output-rarity recipe))
+    (provided-count (len item-ids))
+  )
+    (asserts! (is-eq provided-count required-count) err-insufficient-items)
+    (asserts! (< output-rarity u6) err-invalid-rarity)
+    (let (
+      (validation-result (fold validate-and-consume-item item-ids true))
+    )
+      (asserts! validation-result err-insufficient-items)
+      (let (
+        (random-seed (generate-randomness))
+        (output-item (unwrap! (get-random-item-from-rarity output-rarity random-seed) err-no-items))
+      )
+        (add-to-inventory tx-sender output-item)
+        (update-item-supply output-item)
+        (ok output-item)))))
+
 (define-read-only (get-box-info (box-id uint))
   (map-get? loot-boxes box-id))
 
@@ -205,3 +266,24 @@
       rarity: test-rarity,
       available-items: (get-rarity-pool test-rarity)
     }))
+
+(define-read-only (get-fusion-recipe (input-rarity uint))
+  (map-get? fusion-recipes input-rarity))
+
+(define-read-only (can-user-fuse (user principal) (input-rarity uint))
+  (match (map-get? fusion-recipes input-rarity)
+    recipe
+      (let (
+        (required-count (get input-count recipe))
+        (item-count (fold count-rarity-items (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16 u17 u18 u19 u20) { user: user, rarity: input-rarity, count: u0 }))
+      )
+        (>= (get count item-count) required-count))
+    false))
+
+(define-private (count-rarity-items (item-id uint) (acc { user: principal, rarity: uint, count: uint }))
+  (match (map-get? items item-id)
+    item-data
+      (if (is-eq (get rarity item-data) (get rarity acc))
+        (merge acc { count: (+ (get count acc) (get-user-item-count (get user acc) item-id)) })
+        acc)
+    acc))
