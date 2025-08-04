@@ -8,11 +8,17 @@
 (define-constant err-invalid-item (err u106))
 (define-constant err-insufficient-items (err u107))
 (define-constant err-invalid-fusion (err u108))
+(define-constant err-listing-not-found (err u109))
+(define-constant err-not-listing-owner (err u110))
+(define-constant err-cannot-buy-own-item (err u111))
+(define-constant err-listing-inactive (err u112))
 
 (define-data-var box-counter uint u0)
 (define-data-var item-counter uint u0)
 (define-data-var vrf-seed uint u12345)
 (define-data-var box-price uint u1000000)
+(define-data-var listing-counter uint u0)
+(define-data-var marketplace-fee-percent uint u5)
 
 (define-map loot-boxes uint {
   owner: principal,
@@ -42,6 +48,14 @@
   output-rarity: uint 
 })
 
+(define-map marketplace-listings uint {
+  seller: principal,
+  item-id: uint,
+  price: uint,
+  active: bool,
+  listed-height: uint
+})
+
 (define-private (get-next-box-id)
   (begin
     (var-set box-counter (+ (var-get box-counter) u1))
@@ -51,6 +65,11 @@
   (begin
     (var-set item-counter (+ (var-get item-counter) u1))
     (var-get item-counter)))
+
+(define-private (get-next-listing-id)
+  (begin
+    (var-set listing-counter (+ (var-get listing-counter) u1))
+    (var-get listing-counter)))
 
 (define-private (generate-randomness)
   (let (
@@ -212,6 +231,62 @@
         (update-item-supply output-item)
         (ok output-item)))))
 
+(define-public (list-item-for-sale (item-id uint) (price uint))
+  (begin
+    (asserts! (> price u0) err-insufficient-funds)
+    (asserts! (> (get-user-item-count tx-sender item-id) u0) err-insufficient-items)
+    (asserts! (remove-from-inventory tx-sender item-id u1) err-insufficient-items)
+    (let (
+      (listing-id (get-next-listing-id))
+    )
+      (map-set marketplace-listings listing-id {
+        seller: tx-sender,
+        item-id: item-id,
+        price: price,
+        active: true,
+        listed-height: stacks-block-height
+      })
+      (ok listing-id))))
+
+(define-public (purchase-listed-item (listing-id uint))
+  (let (
+    (listing (unwrap! (map-get? marketplace-listings listing-id) err-listing-not-found))
+  )
+    (asserts! (get active listing) err-listing-inactive)
+    (asserts! (not (is-eq tx-sender (get seller listing))) err-cannot-buy-own-item)
+    (let (
+      (item-price (get price listing))
+      (seller (get seller listing))
+      (item-id (get item-id listing))
+      (marketplace-fee (/ (* item-price (var-get marketplace-fee-percent)) u100))
+      (seller-amount (- item-price marketplace-fee))
+    )
+      (try! (stx-transfer? marketplace-fee tx-sender contract-owner))
+      (try! (stx-transfer? seller-amount tx-sender seller))
+      (map-set marketplace-listings listing-id (merge listing { active: false }))
+      (add-to-inventory tx-sender item-id)
+      (ok item-id))))
+
+(define-public (cancel-listing (listing-id uint))
+  (let (
+    (listing (unwrap! (map-get? marketplace-listings listing-id) err-listing-not-found))
+  )
+    (asserts! (is-eq tx-sender (get seller listing)) err-not-listing-owner)
+    (asserts! (get active listing) err-listing-inactive)
+    (let (
+      (item-id (get item-id listing))
+    )
+      (map-set marketplace-listings listing-id (merge listing { active: false }))
+      (add-to-inventory tx-sender item-id)
+      (ok true))))
+
+(define-public (set-marketplace-fee (new-fee-percent uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (<= new-fee-percent u20) err-invalid-item)
+    (var-set marketplace-fee-percent new-fee-percent)
+    (ok true)))
+
 (define-read-only (get-box-info (box-id uint))
   (map-get? loot-boxes box-id))
 
@@ -287,3 +362,33 @@
         (merge acc { count: (+ (get count acc) (get-user-item-count (get user acc) item-id)) })
         acc)
     acc))
+
+(define-read-only (get-marketplace-listing (listing-id uint))
+  (map-get? marketplace-listings listing-id))
+
+(define-read-only (get-active-listings-count)
+  (var-get listing-counter))
+
+(define-read-only (get-marketplace-fee-percent)
+  (var-get marketplace-fee-percent))
+
+(define-read-only (get-item-market-price (item-id uint))
+  (let (
+    (total-listings (var-get listing-counter))
+  )
+    (fold find-lowest-price (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16 u17 u18 u19 u20) { target-item: item-id, lowest-price: u999999999 })))
+
+(define-private (find-lowest-price (listing-id uint) (acc { target-item: uint, lowest-price: uint }))
+  (match (map-get? marketplace-listings listing-id)
+    listing
+      (if (and (get active listing) (is-eq (get item-id listing) (get target-item acc)))
+        (if (< (get price listing) (get lowest-price acc))
+          (merge acc { lowest-price: (get price listing) })
+          acc)
+        acc)
+    acc))
+
+(define-read-only (is-listing-active (listing-id uint))
+  (match (map-get? marketplace-listings listing-id)
+    listing (get active listing)
+    false))
