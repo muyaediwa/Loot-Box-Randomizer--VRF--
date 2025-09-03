@@ -12,6 +12,10 @@
 (define-constant err-not-listing-owner (err u110))
 (define-constant err-cannot-buy-own-item (err u111))
 (define-constant err-listing-inactive (err u112))
+(define-constant err-item-not-staked (err u113))
+(define-constant err-item-already-staked (err u114))
+(define-constant err-staking-period-not-met (err u115))
+(define-constant err-insufficient-staking-balance (err u116))
 
 (define-data-var box-counter uint u0)
 (define-data-var item-counter uint u0)
@@ -19,6 +23,9 @@
 (define-data-var box-price uint u1000000)
 (define-data-var listing-counter uint u0)
 (define-data-var marketplace-fee-percent uint u5)
+(define-data-var staking-pool-balance uint u0)
+(define-data-var min-staking-period uint u1440)
+(define-data-var base-reward-rate uint u100)
 
 (define-map loot-boxes uint {
   owner: principal,
@@ -54,6 +61,12 @@
   price: uint,
   active: bool,
   listed-height: uint
+})
+
+(define-map staked-items { staker: principal, item-id: uint } {
+  staked-at: uint,
+  reward-claimed-at: uint,
+  quantity: uint
 })
 
 (define-private (get-next-box-id)
@@ -131,6 +144,26 @@
             (remove-from-inventory tx-sender item-id u1)
             false))
       false)))
+
+(define-private (calculate-staking-rewards (staker principal) (item-id uint))
+  (match (map-get? staked-items { staker: staker, item-id: item-id })
+    stake-data
+      (match (map-get? items item-id)
+        item-data
+          (let (
+            (current-height stacks-block-height)
+            (last-claim (get reward-claimed-at stake-data))
+            (blocks-since-claim (- current-height last-claim))
+            (rarity-multiplier (get rarity item-data))
+            (quantity-staked (get quantity stake-data))
+            (base-rate (var-get base-reward-rate))
+            (reward-per-block (/ (* base-rate rarity-multiplier) u1000))
+          )
+            (* reward-per-block (* blocks-since-claim quantity-staked)))
+        u0)
+    u0))
+
+
 
 (define-public (initialize-rarity-pools)
   (begin
@@ -287,6 +320,62 @@
     (var-set marketplace-fee-percent new-fee-percent)
     (ok true)))
 
+(define-public (stake-item (item-id uint) (quantity uint))
+  (begin
+    (asserts! (> quantity u0) err-insufficient-items)
+    (asserts! (>= (get-user-item-count tx-sender item-id) quantity) err-insufficient-items)
+    (asserts! (is-none (map-get? staked-items { staker: tx-sender, item-id: item-id })) err-item-already-staked)
+    (asserts! (remove-from-inventory tx-sender item-id quantity) err-insufficient-items)
+    (map-set staked-items { staker: tx-sender, item-id: item-id } {
+      staked-at: stacks-block-height,
+      reward-claimed-at: stacks-block-height,
+      quantity: quantity
+    })
+    (ok true)))
+
+(define-public (unstake-item (item-id uint))
+  (let (
+    (stake-data (unwrap! (map-get? staked-items { staker: tx-sender, item-id: item-id }) err-item-not-staked))
+    (blocks-staked (- stacks-block-height (get staked-at stake-data)))
+    (min-period (var-get min-staking-period))
+    (quantity (get quantity stake-data))
+  )
+    (asserts! (>= blocks-staked min-period) err-staking-period-not-met)
+    (map-delete staked-items { staker: tx-sender, item-id: item-id })
+    (let (
+      (current-amount (default-to u0 (map-get? user-inventory { user: tx-sender, item-id: item-id })))
+    )
+      (map-set user-inventory { user: tx-sender, item-id: item-id } (+ current-amount quantity)))
+    (ok true)))
+
+(define-public (claim-staking-rewards (item-id uint))
+  (let (
+    (stake-data (unwrap! (map-get? staked-items { staker: tx-sender, item-id: item-id }) err-item-not-staked))
+    (reward-amount (calculate-staking-rewards tx-sender item-id))
+    (pool-balance (var-get staking-pool-balance))
+  )
+    (asserts! (> reward-amount u0) err-insufficient-staking-balance)
+    (asserts! (>= pool-balance reward-amount) err-insufficient-staking-balance)
+    (try! (as-contract (stx-transfer? reward-amount tx-sender tx-sender)))
+    (var-set staking-pool-balance (- pool-balance reward-amount))
+    (map-set staked-items { staker: tx-sender, item-id: item-id }
+      (merge stake-data { reward-claimed-at: stacks-block-height }))
+    (ok reward-amount)))
+
+(define-public (fund-staking-pool (amount uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    (var-set staking-pool-balance (+ (var-get staking-pool-balance) amount))
+    (ok true)))
+
+(define-public (set-staking-parameters (min-period uint) (reward-rate uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (var-set min-staking-period min-period)
+    (var-set base-reward-rate reward-rate)
+    (ok true)))
+
 (define-read-only (get-box-info (box-id uint))
   (map-get? loot-boxes box-id))
 
@@ -392,3 +481,41 @@
   (match (map-get? marketplace-listings listing-id)
     listing (get active listing)
     false))
+
+(define-read-only (get-staking-info (staker principal) (item-id uint))
+  (map-get? staked-items { staker: staker, item-id: item-id }))
+
+(define-read-only (get-pending-staking-rewards (staker principal) (item-id uint))
+  (calculate-staking-rewards staker item-id))
+
+(define-read-only (get-staking-pool-balance)
+  (var-get staking-pool-balance))
+
+(define-read-only (get-staking-parameters)
+  { 
+    min-period: (var-get min-staking-period),
+    base-reward-rate: (var-get base-reward-rate)
+  })
+
+(define-read-only (is-item-staked (staker principal) (item-id uint))
+  (is-some (map-get? staked-items { staker: staker, item-id: item-id })))
+
+(define-read-only (get-total-staking-value (staker principal))
+  (let (
+    (total-items (var-get item-counter))
+  )
+    (fold calculate-user-staking-value (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16 u17 u18 u19 u20) { user: staker, total-value: u0 })))
+
+(define-private (calculate-user-staking-value (item-id uint) (acc { user: principal, total-value: uint }))
+  (match (map-get? staked-items { staker: (get user acc), item-id: item-id })
+    stake-data
+      (match (map-get? items item-id)
+        item-data
+          (let (
+            (quantity (get quantity stake-data))
+            (item-value (get value item-data))
+            (stake-value (* quantity item-value))
+          )
+            (merge acc { total-value: (+ (get total-value acc) stake-value) }))
+        acc)
+    acc))
