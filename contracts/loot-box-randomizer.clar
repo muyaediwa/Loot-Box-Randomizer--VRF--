@@ -16,6 +16,11 @@
 (define-constant err-item-already-staked (err u114))
 (define-constant err-staking-period-not-met (err u115))
 (define-constant err-insufficient-staking-balance (err u116))
+(define-constant err-draw-not-found (err u117))
+(define-constant err-draw-not-active (err u118))
+(define-constant err-draw-already-ended (err u119))
+(define-constant err-no-tickets-sold (err u120))
+(define-constant err-invalid-prize (err u121))
 
 (define-data-var box-counter uint u0)
 (define-data-var item-counter uint u0)
@@ -26,6 +31,8 @@
 (define-data-var staking-pool-balance uint u0)
 (define-data-var min-staking-period uint u1440)
 (define-data-var base-reward-rate uint u100)
+(define-data-var draw-counter uint u0)
+(define-data-var default-ticket-price uint u500000)
 
 (define-map loot-boxes uint {
   owner: principal,
@@ -69,6 +76,19 @@
   quantity: uint
 })
 
+(define-map lucky-draws uint {
+  prize-type: (string-ascii 10),
+  prize-id: uint,
+  ticket-price: uint,
+  end-height: uint,
+  total-tickets: uint,
+  active: bool,
+  winner: (optional principal)
+})
+
+(define-map draw-tickets { draw-id: uint, ticket-number: uint } principal)
+(define-map user-draw-tickets { user: principal, draw-id: uint } uint)
+
 (define-private (get-next-box-id)
   (begin
     (var-set box-counter (+ (var-get box-counter) u1))
@@ -78,6 +98,11 @@
   (begin
     (var-set item-counter (+ (var-get item-counter) u1))
     (var-get item-counter)))
+
+(define-private (get-next-draw-id)
+  (begin
+    (var-set draw-counter (+ (var-get draw-counter) u1))
+    (var-get draw-counter)))
 
 (define-private (get-next-listing-id)
   (begin
@@ -376,6 +401,71 @@
     (var-set base-reward-rate reward-rate)
     (ok true)))
 
+(define-public (create-draw (prize-type (string-ascii 10)) (prize-id uint) (duration-blocks uint) (ticket-price uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (or (is-eq prize-type "item") (is-eq prize-type "stx")) err-invalid-prize)
+    (let (
+      (draw-id (get-next-draw-id))
+      (end-height (+ stacks-block-height duration-blocks))
+    )
+      (map-set lucky-draws draw-id {
+        prize-type: prize-type,
+        prize-id: prize-id,
+        ticket-price: ticket-price,
+        end-height: end-height,
+        total-tickets: u0,
+        active: true,
+        winner: none
+      })
+      (ok draw-id))))
+
+(define-public (buy-draw-ticket (draw-id uint) (quantity uint))
+  (let (
+    (draw (unwrap! (map-get? lucky-draws draw-id) err-draw-not-found))
+    (ticket-price (get ticket-price draw))
+    (total-cost (* ticket-price quantity))
+    (current-tickets (get total-tickets draw))
+    (user-tickets (default-to u0 (map-get? user-draw-tickets { user: tx-sender, draw-id: draw-id })))
+  )
+    (asserts! (get active draw) err-draw-not-active)
+    (asserts! (< stacks-block-height (get end-height draw)) err-draw-already-ended)
+    (try! (stx-transfer? total-cost tx-sender contract-owner))
+    (map-set lucky-draws draw-id (merge draw { total-tickets: (+ current-tickets quantity) }))
+    (map-set user-draw-tickets { user: tx-sender, draw-id: draw-id } (+ user-tickets quantity))
+    (map-set draw-tickets { draw-id: draw-id, ticket-number: (+ current-tickets u1) } tx-sender)
+    (ok (+ current-tickets quantity))))
+
+(define-public (execute-draw (draw-id uint))
+  (let (
+    (draw (unwrap! (map-get? lucky-draws draw-id) err-draw-not-found))
+  )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (get active draw) err-draw-not-active)
+    (asserts! (>= stacks-block-height (get end-height draw)) err-draw-not-active)
+    (asserts! (> (get total-tickets draw) u0) err-no-tickets-sold)
+    (let (
+      (random-seed (generate-randomness))
+      (winning-ticket (+ u1 (mod random-seed (get total-tickets draw))))
+      (winner (unwrap! (map-get? draw-tickets { draw-id: draw-id, ticket-number: winning-ticket }) err-draw-not-found))
+      (prize-type (get prize-type draw))
+      (prize-id (get prize-id draw))
+    )
+      (map-set lucky-draws draw-id (merge draw { active: false, winner: (some winner) }))
+      (if (is-eq prize-type "item")
+        (add-to-inventory winner prize-id)
+        (try! (as-contract (stx-transfer? prize-id tx-sender winner))))
+      (ok winner))))
+
+(define-public (cancel-draw (draw-id uint))
+  (let (
+    (draw (unwrap! (map-get? lucky-draws draw-id) err-draw-not-found))
+  )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (get active draw) err-draw-not-active)
+    (map-set lucky-draws draw-id (merge draw { active: false }))
+    (ok true)))
+
 (define-read-only (get-box-info (box-id uint))
   (map-get? loot-boxes box-id))
 
@@ -519,3 +609,32 @@
             (merge acc { total-value: (+ (get total-value acc) stake-value) }))
         acc)
     acc))
+
+(define-read-only (get-draw-info (draw-id uint))
+  (map-get? lucky-draws draw-id))
+
+(define-read-only (get-user-draw-tickets (user principal) (draw-id uint))
+  (default-to u0 (map-get? user-draw-tickets { user: user, draw-id: draw-id })))
+
+(define-read-only (get-total-draws)
+  (var-get draw-counter))
+
+(define-read-only (is-draw-active (draw-id uint))
+  (match (map-get? lucky-draws draw-id)
+    draw (and (get active draw) (< stacks-block-height (get end-height draw)))
+    false))
+
+(define-read-only (get-draw-winner (draw-id uint))
+  (match (map-get? lucky-draws draw-id)
+    draw (get winner draw)
+    none))
+
+(define-read-only (calculate-draw-pool (draw-id uint))
+  (match (map-get? lucky-draws draw-id)
+    draw 
+      (let (
+        (total-tickets (get total-tickets draw))
+        (ticket-price (get ticket-price draw))
+      )
+        (* total-tickets ticket-price))
+    u0))
