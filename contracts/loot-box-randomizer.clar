@@ -45,6 +45,8 @@
   rarity: uint
 })
 
+(define-map box-approvals uint principal)
+
 (define-map items uint {
   name: (string-ascii 64),
   rarity: uint,
@@ -500,6 +502,9 @@
 (define-read-only (get-contract-owner)
   contract-owner)
 
+(define-read-only (get-box-approval (box-id uint))
+  (map-get? box-approvals box-id))
+
 (define-read-only (is-box-opened (box-id uint))
   (match (map-get? loot-boxes box-id)
     box-data (get opened box-data)
@@ -638,3 +643,26 @@
       )
         (* total-tickets ticket-price))
     u0))
+
+(define-public (approve-box (box-id uint) (spender principal))
+  (let (
+    (box-data (unwrap! (map-get? loot-boxes box-id) err-box-not-found))
+    (owner (get owner box-data))
+  )
+    (asserts! (is-eq tx-sender owner) err-owner-only)
+    (map-set box-approvals box-id spender)
+    (ok true)))
+
+(define-public (transfer-box (box-id uint) (to principal))
+  (let (
+    (box-data (unwrap! (map-get? loot-boxes box-id) err-box-not-found))
+    (opened (get opened box-data))
+    (owner (get owner box-data))
+    (approval (map-get? box-approvals box-id))
+    (is-approved (match approval a (is-eq a tx-sender) false))
+  )
+    (asserts! (not opened) err-already-opened)
+    (asserts! (or (is-eq tx-sender owner) is-approved) err-owner-only)
+    (map-set loot-boxes box-id (merge box-data { owner: to }))
+    (map-delete box-approvals box-id)
+    (ok true)))
